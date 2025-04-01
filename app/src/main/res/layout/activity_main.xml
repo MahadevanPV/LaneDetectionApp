@@ -15,16 +15,14 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <ImageView
-        android:id="@+id/overlayImageView"
+    <SurfaceView
+        android:id="@+id/laneOverlaySurface"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:scaleType="fitXY"
         app:layout_constraintTop_toTopOf="@+id/viewFinder"
         app:layout_constraintBottom_toBottomOf="@+id/viewFinder"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        android:contentDescription="Lane detection overlay" />
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <LinearLayout
         android:id="@+id/controlsLayout"

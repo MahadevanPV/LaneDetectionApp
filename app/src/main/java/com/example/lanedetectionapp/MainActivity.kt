@@ -2,14 +2,13 @@ package com.example.lanedetectionapp
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Matrix
+import android.graphics.*
 import android.os.Bundle
 import android.os.Build
 import android.util.Log
 import android.util.Size
-import android.widget.ImageView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -19,8 +18,6 @@ import androidx.core.content.ContextCompat
 import com.example.lanedetectionapp.databinding.ActivityMainBinding
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import com.example.lanedetectionapp.LaneDetector
-import com.example.lanedetectionapp.ImageUtils
 import androidx.appcompat.app.AlertDialog
 
 @OptIn(androidx.camera.core.ExperimentalGetImage::class)
@@ -32,6 +29,11 @@ class MainActivity : AppCompatActivity() {
     private var imageCapture: ImageCapture? = null
     private var isDetectionRunning = false
     private lateinit var laneDetector: LaneDetector
+
+    // Surface for drawing lanes
+    private lateinit var laneOverlaySurface: SurfaceView
+    private var laneSurfaceHolder: SurfaceHolder? = null
+    private var lanePaint: Paint? = null
 
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10
@@ -54,8 +56,20 @@ class MainActivity : AppCompatActivity() {
         // Initialize lane detector
         laneDetector = LaneDetector(this)
 
-        // Configure the overlay image view scale type
-        binding.overlayImageView.scaleType = ImageView.ScaleType.FIT_XY
+        // Initialize surface for lane drawing
+        laneOverlaySurface = binding.laneOverlaySurface
+        laneSurfaceHolder = laneOverlaySurface.holder
+
+        // Setup transparent background for the overlay
+        laneOverlaySurface.setZOrderOnTop(true)
+        laneSurfaceHolder?.setFormat(PixelFormat.TRANSPARENT)
+
+        // Initialize paint for lane drawing
+        lanePaint = Paint().apply {
+            isAntiAlias = true
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+        }
 
         // Check permissions and start camera
         checkPermissionsAndStartCamera()
@@ -64,6 +78,11 @@ class MainActivity : AppCompatActivity() {
         binding.toggleDetectionButton.setOnClickListener {
             isDetectionRunning = !isDetectionRunning
             binding.toggleDetectionButton.text = if (isDetectionRunning) "Stop Detection" else "Start Detection"
+
+            // Clear lane overlay when detection is stopped
+            if (!isDetectionRunning) {
+                clearLaneOverlay()
+            }
         }
 
         binding.captureButton.setOnClickListener {
@@ -141,12 +160,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun requestPermissions() {
-        ActivityCompat.requestPermissions(
-            this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-        )
-    }
-
     private fun startCamera() {
         Log.d(TAG, "Starting Camera Setup")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -156,7 +169,7 @@ class MainActivity : AppCompatActivity() {
 
             // Set up the preview use case
             val preview = Preview.Builder()
-                .setTargetResolution(Size(640, 360))  // Match with model input size
+                .setTargetResolution(Size(400, 144))  // Match with model input size
                 .build()
                 .also {
                     it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
@@ -164,20 +177,27 @@ class MainActivity : AppCompatActivity() {
 
             // Set up the image capture use case
             imageCapture = ImageCapture.Builder()
-                .setTargetResolution(Size(640, 360))  // Match with model input size
+                .setTargetResolution(Size(400, 144))  // Match with model input size
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .build()
 
             // Set up the image analysis use case
             val imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetResolution(Size(640, 360))  // Match with model input size
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setTargetResolution(Size(400, 144))  // Match with model input size
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST) // Only process latest frame
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888) // Specify format
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
                         if (isDetectionRunning) {
                             processImageProxy(imageProxy)
                         } else {
-                            imageProxy.close()
+                            // Important: close the image if not processing it
+                            try {
+                                imageProxy.close()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error closing image proxy: ${e.message}")
+                            }
                         }
                     }
                 }
@@ -204,56 +224,138 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processImageProxy(imageProxy: ImageProxy) {
-        val image = imageProxy.image ?: run {
-            imageProxy.close()
-            return
-        }
-
         try {
-            // Convert the image to bitmap properly
-            val bitmap = imageProxyToBitmap(imageProxy)
+            val image = imageProxy.image ?: run {
+                imageProxy.close()
+                return
+            }
+
+            // Convert the image to bitmap
+            val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+
             if (bitmap != null) {
-                // Detect lanes on the bitmap
-                val (resultBitmap, inferenceTime) = laneDetector.detectLanes(bitmap)
+                try {
+                    // Detect lanes and get lane points rather than a new bitmap
+                    val (lanePoints, inferenceTime) = laneDetector.detectLanesPoints(bitmap)
 
-                // Update the overlay image view on the main thread
-                runOnUiThread {
-                    try {
-                        // Create a copy before setting it to ImageView and recycling the original
-                        val displayBitmap = resultBitmap.copy(resultBitmap.config, false)
-                        binding.overlayImageView.setImageBitmap(displayBitmap)
+                    // Update the UI with the inference time
+                    runOnUiThread {
                         binding.inferenceTimeTextView.text = "Inference Time: $inferenceTime ms"
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error displaying result: ${e.message}")
-                    } finally {
-                        // Now it's safe to recycle the original
-                        if (!resultBitmap.isRecycled) {
-                            resultBitmap.recycle()
-                        }
                     }
-                }
 
-                // Safely recycle the original bitmap
-                if (!bitmap.isRecycled) {
-                    bitmap.recycle()
+                    // Draw the lane points on the overlay surface
+                    drawLanesOnSurface(lanePoints)
+
+                    // Safely recycle the bitmap
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in lane detection process: ${e.message}")
+                    e.printStackTrace()
+
+                    // Make sure to recycle the bitmap in case of error
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error processing image: ${e.message}")
+            e.printStackTrace()
         } finally {
-            imageProxy.close()
+            // Always close the imageProxy to release resources
+            try {
+                imageProxy.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing image proxy: ${e.message}")
+            }
         }
     }
 
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
-        return ImageUtils.imageProxyToBitmap(imageProxy)
+    private fun drawLanesOnSurface(lanePoints: Array<List<Pair<Float, Float>>>) {
+        // Get the canvas from the surface holder
+        val canvas = laneSurfaceHolder?.lockCanvas()
+        canvas?.let {
+            try {
+                // Clear the canvas
+                it.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+                // Scale factors to map from model dimensions to view dimensions
+                val scaleX = laneOverlaySurface.width.toFloat() / laneDetector.getInputWidth()
+                val scaleY = laneOverlaySurface.height.toFloat() / laneDetector.getInputHeight()
+
+                // Draw each lane
+                val laneColors = arrayOf(Color.GREEN, Color.BLUE)
+
+                for (laneIdx in lanePoints.indices) {
+                    val lane = lanePoints[laneIdx]
+                    if (lane.size < 2) continue
+
+                    // Set lane color
+                    lanePaint?.color = laneColors[laneIdx % laneColors.size]
+
+                    // Create a path for the lane
+                    val path = Path()
+                    val sortedPoints = lane.sortedBy { it.second }
+
+                    // Move to first point
+                    path.moveTo(sortedPoints[0].first * scaleX, sortedPoints[0].second * scaleY)
+
+                    // Add line segments to subsequent points
+                    for (i in 1 until sortedPoints.size) {
+                        path.lineTo(sortedPoints[i].first * scaleX, sortedPoints[i].second * scaleY)
+                    }
+
+                    // Draw the path
+                    lanePaint?.let { paint ->
+                        it.drawPath(path, paint)
+                    }
+
+                    // Optionally draw points for visualization
+                    val pointPaint = Paint().apply {
+                        color = laneColors[laneIdx % laneColors.size]
+                        style = Paint.Style.FILL
+                        isAntiAlias = true
+                    }
+
+                    for (point in sortedPoints) {
+                        it.drawCircle(point.first * scaleX, point.second * scaleY, 3f, pointPaint)
+                    }
+                }
+
+                // Add inference time info
+                val textPaint = Paint().apply {
+                    color = Color.WHITE
+                    textSize = 30f
+                    style = Paint.Style.FILL
+                    setShadowLayer(2f, 1f, 1f, Color.BLACK)
+                }
+
+            } finally {
+                // Release the canvas
+                laneSurfaceHolder?.unlockCanvasAndPost(it)
+            }
+        }
+    }
+
+    private fun clearLaneOverlay() {
+        val canvas = laneSurfaceHolder?.lockCanvas()
+        canvas?.let {
+            try {
+                // Clear the canvas
+                it.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            } finally {
+                laneSurfaceHolder?.unlockCanvasAndPost(it)
+            }
+        }
     }
 
     private fun takePhoto() {
         val imageCapture = imageCapture ?: return
 
         try {
-            // For demonstration, try using the actual camera capture instead of a dummy bitmap
+            // Use the image capture for a single photo
             imageCapture.takePicture(
                 ContextCompat.getMainExecutor(this),
                 object : ImageCapture.OnImageCapturedCallback() {
@@ -261,71 +363,68 @@ class MainActivity : AppCompatActivity() {
                     override fun onCaptureSuccess(image: ImageProxy) {
                         try {
                             // Convert captured image to bitmap
-                            val bitmap = imageProxyToBitmap(image)
+                            val bitmap = ImageUtils.imageProxyToBitmap(image)
+
                             if (bitmap != null) {
-                                // Process the bitmap with lane detection
-                                val (resultBitmap, inferenceTime) = laneDetector.detectLanes(bitmap)
+                                try {
+                                    // Process the bitmap with lane detection
+                                    val (lanePoints, inferenceTime) = laneDetector.detectLanesPoints(bitmap)
 
-                                // Display the result
-                                val displayBitmap = resultBitmap.copy(resultBitmap.config, false)
-                                binding.overlayImageView.setImageBitmap(displayBitmap)
-                                binding.inferenceTimeTextView.text = "Inference Time: $inferenceTime ms"
+                                    // Update the inference time display
+                                    runOnUiThread {
+                                        binding.inferenceTimeTextView.text = "Inference Time: $inferenceTime ms"
+                                    }
 
-                                // Clean up
-                                if (!resultBitmap.isRecycled) {
-                                    resultBitmap.recycle()
+                                    // Draw the lanes on the overlay
+                                    drawLanesOnSurface(lanePoints)
+
+                                    // Clean up
+                                    if (!bitmap.isRecycled) {
+                                        bitmap.recycle()
+                                    }
+
+                                    Toast.makeText(baseContext, "Photo captured", Toast.LENGTH_SHORT).show()
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error processing capture: ${e.message}")
+                                    e.printStackTrace()
+
+                                    // Clean up bitmap on error
+                                    if (!bitmap.isRecycled) {
+                                        bitmap.recycle()
+                                    }
                                 }
-                                if (!bitmap.isRecycled) {
-                                    bitmap.recycle()
-                                }
-
-                                Toast.makeText(baseContext, "Photo captured", Toast.LENGTH_SHORT).show()
                             }
-
-                            // Close the image proxy
-                            image.close()
                         } catch (e: Exception) {
                             Log.e(TAG, "Error processing captured photo: ${e.message}")
-                            image.close()
+                            e.printStackTrace()
+                        } finally {
+                            // Important: close the image
+                            try {
+                                image.close()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error closing captured image: ${e.message}")
+                            }
                         }
                     }
 
                     override fun onError(exception: ImageCaptureException) {
                         Log.e(TAG, "Photo capture failed: ${exception.message}", exception)
-                        Toast.makeText(baseContext, "Photo capture failed", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(baseContext, "Photo capture failed: ${exception.message}",
+                            Toast.LENGTH_SHORT).show()
                     }
                 }
             )
         } catch (e: Exception) {
-            // Fallback to using a resource bitmap if camera capture fails
-            try {
-                val bitmap = BitmapFactory.decodeResource(resources, android.R.drawable.ic_menu_camera)
-
-                // Process the bitmap
-                val (resultBitmap, inferenceTime) = laneDetector.detectLanes(bitmap)
-
-                try {
-                    // Display the result - use a copy to prevent recycling issues
-                    val displayBitmap = resultBitmap.copy(resultBitmap.config, false)
-                    binding.overlayImageView.setImageBitmap(displayBitmap)
-                    binding.inferenceTimeTextView.text = "Inference Time: $inferenceTime ms"
-
-                    Toast.makeText(baseContext, "Photo captured (fallback)", Toast.LENGTH_SHORT).show()
-                } finally {
-                    // Recycle bitmaps we created
-                    if (!resultBitmap.isRecycled) {
-                        resultBitmap.recycle()
-                    }
-                }
-            } catch (e2: Exception) {
-                Log.e(TAG, "Error processing photo (fallback): ${e2.message}")
-                Toast.makeText(baseContext, "Error processing photo", Toast.LENGTH_SHORT).show()
-            }
+            // Fallback to show error
+            Log.e(TAG, "Error taking photo: ${e.message}")
+            Toast.makeText(baseContext, "Error taking photo: ${e.message}",
+                Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        // Ensure we shut down executors and close resources
         cameraExecutor.shutdown()
         laneDetector.close()
     }
